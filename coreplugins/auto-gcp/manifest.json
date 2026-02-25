@@ -1,0 +1,7 @@
+{
+    "name": "Auto-GCP Estimator",
+    "description": "Automatically estimates GCP pixel locations from Emlid CSV and drone imagery.",
+    "version": "0.1.0",
+    "author": "jrstear",
+    "permissions": []
+}
