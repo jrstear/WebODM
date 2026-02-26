@@ -1,7 +1,6 @@
 from app.plugins import PluginBase, MountPoint
 
 from .api_views import GenerateGCPView, DownloadGCPView
-from .app_views import LoadButtonView
 
 
 class Plugin(PluginBase):
@@ -15,9 +14,4 @@ class Plugin(PluginBase):
         return [
             MountPoint("task/(?P<pk>[^/.]+)/generate", GenerateGCPView.as_view()),
             MountPoint("task/(?P<pk>[^/.]+)/download/(?P<filename>[^/]+)", DownloadGCPView.as_view()),
-        ]
-
-    def app_mount_points(self):
-        return [
-            MountPoint("load_buttons.js$", LoadButtonView(self)),
         ]

@@ -31,8 +31,8 @@ class GenerateGCPView(APIView):
             tmp_csv_path = tmp.name
 
         try:
-            # Resolve task paths
-            images_dir = str(task.task_path("images"))
+            # Resolve task paths — images live in the task root, not a subdirectory
+            images_dir = str(task.task_path())
 
             # Find reconstruction.json if requested
             reconstruction_path = None
@@ -42,19 +42,23 @@ class GenerateGCPView(APIView):
                 if os.path.exists(candidate):
                     reconstruction_path = candidate
 
-            # Run pipeline synchronously
+            # Run pipeline synchronously.
+            # threads=1 uses the sequential code path — no multiprocessing.Pool,
+            # which avoids fork-of-fork deadlocks inside gunicorn preloaded workers.
+            # For typical GCP datasets (tens of images) this is plenty fast.
             from .pipeline import run_pipeline
             gcpeditpro_txt, estimates_json = run_pipeline(
                 images_dir=images_dir,
                 emlid_csv_path=tmp_csv_path,
                 reconstruction_path=reconstruction_path,
+                threads=1,
             )
 
             # Write outputs to task assets directory
             out_dir = Path(str(task.assets_path()))
             out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / 'gcpeditpro.txt').write_text(gcpeditpro_txt)
-            (out_dir / 'gcpeditpro.estimates.json').write_text(estimates_json)
+            (out_dir / 'gcp_estimates.txt').write_text(gcpeditpro_txt)
+            (out_dir / 'gcp_estimates.json').write_text(estimates_json)
 
         except Exception as e:
             return Response({'error': str(e)},
@@ -66,8 +70,8 @@ class GenerateGCPView(APIView):
                 pass
 
         return Response({
-            'gcpeditpro_txt': '/api/plugins/auto-gcp/task/{}/download/gcpeditpro.txt'.format(pk),
-            'estimates_json': '/api/plugins/auto-gcp/task/{}/download/gcpeditpro.estimates.json'.format(pk),
+            'gcpeditpro_txt': '/api/plugins/auto_gcp/task/{}/download/gcp_estimates.txt'.format(pk),
+            'estimates_json': '/api/plugins/auto_gcp/task/{}/download/gcp_estimates.json'.format(pk),
         })
 
 
@@ -78,7 +82,7 @@ class DownloadGCPView(APIView):
         task = get_object_or_404(Task, pk=pk, project__owner=request.user)
 
         # Restrict to known safe filenames
-        allowed = {'gcpeditpro.txt', 'gcpeditpro.estimates.json'}
+        allowed = {'gcp_estimates.txt', 'gcp_estimates.json'}
         if filename not in allowed:
             raise Http404
 
