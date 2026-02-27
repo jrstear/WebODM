@@ -57,8 +57,8 @@ class GenerateGCPView(APIView):
             # Write outputs to task assets directory
             out_dir = Path(str(task.assets_path()))
             out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / 'gcp_estimates.txt').write_text(gcpeditpro_txt)
-            (out_dir / 'gcp_estimates.json').write_text(estimates_json)
+            (out_dir / 'gcpeditpro.txt').write_text(gcpeditpro_txt)
+            (out_dir / 'gcpeditpro.json').write_text(estimates_json)
 
         except Exception as e:
             return Response({'error': str(e)},
@@ -70,8 +70,8 @@ class GenerateGCPView(APIView):
                 pass
 
         return Response({
-            'gcpeditpro_txt': '/api/plugins/auto_gcp/task/{}/download/gcp_estimates.txt'.format(pk),
-            'estimates_json': '/api/plugins/auto_gcp/task/{}/download/gcp_estimates.json'.format(pk),
+            'gcpeditpro_txt': '/api/plugins/auto_gcp/task/{}/download/gcpeditpro.txt'.format(pk),
+            'estimates_json': '/api/plugins/auto_gcp/task/{}/download/gcpeditpro.json'.format(pk),
         })
 
 
@@ -82,7 +82,7 @@ class DownloadGCPView(APIView):
         task = get_object_or_404(Task, pk=pk, project__owner=request.user)
 
         # Restrict to known safe filenames
-        allowed = {'gcp_estimates.txt', 'gcp_estimates.json'}
+        allowed = {'gcpeditpro.txt', 'gcpeditpro.json'}
         if filename not in allowed:
             raise Http404
 
