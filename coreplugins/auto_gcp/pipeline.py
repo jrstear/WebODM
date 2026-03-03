@@ -2,7 +2,7 @@
 Thin wrapper that imports run_pipeline from the geo repo.
 
 If ~/git/geo is not on the Python path (e.g. inside a Docker container),
-a self-contained copy of gcp_pipeline.py should be placed here instead.
+a self-contained copy of emlid2gcp.py should be placed here instead.
 """
 import sys
 import os
@@ -18,11 +18,11 @@ for _path in [_HERE, _GEO_REPO]:
         sys.path.insert(0, _path)
 
 try:
-    from gcp_pipeline import run_pipeline  # noqa: F401
+    from emlid2gcp import run_pipeline  # noqa: F401
 except ImportError as e:
     raise ImportError(
-        "Cannot import gcp_pipeline. "
-        "Place gcp_pipeline.py alongside this file ({}/) "
+        "Cannot import emlid2gcp. "
+        "Place emlid2gcp.py alongside this file ({}/) "
         "or ensure ~/git/geo is on the Python path. "
         "Original error: {}".format(_HERE, e)
     )

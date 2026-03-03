@@ -47,7 +47,7 @@ class GenerateGCPView(APIView):
             # which avoids fork-of-fork deadlocks inside gunicorn preloaded workers.
             # For typical GCP datasets (tens of images) this is plenty fast.
             from .pipeline import run_pipeline
-            gcpeditpro_txt, estimates_json = run_pipeline(
+            gcpeditpro_txt, _ = run_pipeline(
                 images_dir=images_dir,
                 emlid_csv_path=tmp_csv_path,
                 reconstruction_path=reconstruction_path,
@@ -58,7 +58,6 @@ class GenerateGCPView(APIView):
             out_dir = Path(str(task.assets_path()))
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / 'gcpeditpro.txt').write_text(gcpeditpro_txt)
-            (out_dir / 'gcpeditpro.json').write_text(estimates_json)
 
         except Exception as e:
             return Response({'error': str(e)},
@@ -71,7 +70,6 @@ class GenerateGCPView(APIView):
 
         return Response({
             'gcpeditpro_txt': '/api/plugins/auto_gcp/task/{}/download/gcpeditpro.txt'.format(pk),
-            'estimates_json': '/api/plugins/auto_gcp/task/{}/download/gcpeditpro.json'.format(pk),
         })
 
 
@@ -82,7 +80,7 @@ class DownloadGCPView(APIView):
         task = get_object_or_404(Task, pk=pk, project__owner=request.user)
 
         # Restrict to known safe filenames
-        allowed = {'gcpeditpro.txt', 'gcpeditpro.json'}
+        allowed = {'gcpeditpro.txt'}
         if filename not in allowed:
             raise Http404
 

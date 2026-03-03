@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-GCP estimation pipeline — replaces gcp.py.
+emlid2gcp — Emlid CSV + drone images → GCP pixel estimates.
 
 Stages:
   B1  parse_emlid_csv()           Parse Emlid Reach CSV (all solution statuses).
   B1  read_image_exif_batch()     Batch exiftool read for all images in parallel.
   B1  match_images_to_gcps()      Footprint-based image↔GCP association.
-  B2  project_pixel_mode_a()      EXIF-based nadir pinhole projection.
+  B2  project_pixel_mode_a()      EXIF-based pinhole projection (nadir + oblique).
   B2  project_pixel_mode_b()      reconstruction.json-based projection (optional).
   B3  run_pipeline()              Full pipeline: B1 → B2 → write outputs.
 """
@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 METERS_PER_DEG_LAT = 111319.9
 FULL_FRAME_DIAG_MM = math.sqrt(36**2 + 24**2)   # 43.267 mm
 FT_TO_M = 0.3048
+NADIR_TOL_DEG = 10.0   # pitch within 10° of -90° is treated as nadir
 
 # ---------------------------------------------------------------------------
 # B1 — Emlid CSV Parser
@@ -306,18 +307,38 @@ def match_images_to_gcps(exif_map: Dict[str, dict],
 # B2 — Pixel Projection
 # ---------------------------------------------------------------------------
 
+def is_nadir(exif: dict) -> bool:
+    """Return True if the image pitch is within NADIR_TOL_DEG of straight down (-90°)."""
+    pitch = exif.get('gimbal_pitch')
+    if pitch is None:
+        return True   # no pitch data → assume nadir (legacy behaviour)
+    return abs(pitch + 90.0) <= NADIR_TOL_DEG
+
+
 def project_pixel_mode_a(exif: dict, gcp: dict) -> Optional[Tuple[float, float]]:
     """
     Project GCP world coordinates to pixel (px, py) using EXIF-only camera model.
 
-    Uses nadir pinhole projection with GimbalYaw rotation and GimbalRoll flip.
-    Validated: mean 73.6 px error at 7–99 m AGL (see docs/dji_m3e_camera_model.md).
+    Handles both nadir (pitch ≈ -90°) and oblique cameras via a full 3D rotation
+    matrix derived from gimbal pitch (θ) and yaw (ψ):
+
+        X_cam (image right) = ( cos(ψ),        -sin(ψ),         0     )
+        Z_cam (optical axis) = ( cos(θ)·sin(ψ),  cos(θ)·cos(ψ),  sin(θ))
+        Y_cam (image down)   = ( sin(θ)·sin(ψ),  sin(θ)·cos(ψ), -cos(θ))
+                             = Z_cam × X_cam
+
+    At θ = -90° this degenerates to the original nadir formula.
+    GimbalRoll = 180° flips both X and Y axes (opposite-facing mount).
+
+    Validated (nadir): mean 73.6 px error at 7–99 m AGL
+    (see docs/dji_m3e_camera_model.md).
 
     Returns (px, py) in image pixel space, or None if GCP is behind/out of frame.
     """
     cam_lat   = exif['lat']
     cam_lon   = exif['lon']
-    cam_alt   = exif.get('abs_alt')       # WGS84 ellipsoidal, metres
+    cam_alt   = exif.get('abs_alt')        # WGS84 ellipsoidal, metres
+    pitch_deg = exif.get('gimbal_pitch', -90.0) or -90.0   # default nadir
     yaw_deg   = exif.get('gimbal_yaw')
     roll_deg  = exif.get('gimbal_roll')
     focal_mm  = exif.get('focal_mm')
@@ -325,11 +346,10 @@ def project_pixel_mode_a(exif: dict, gcp: dict) -> Optional[Tuple[float, float]]
     img_w     = exif.get('img_w')
     img_h     = exif.get('img_h')
 
-    gcp_lat      = gcp['lat']
-    gcp_lon      = gcp['lon']
-    gcp_alt      = gcp.get('ellip_alt_m')  # WGS84 ellipsoidal, metres
+    gcp_lat   = gcp['lat']
+    gcp_lon   = gcp['lon']
+    gcp_alt   = gcp.get('ellip_alt_m')    # WGS84 ellipsoidal, metres
 
-    # Require all essential parameters
     if any(v is None for v in [cam_alt, gcp_alt, yaw_deg, roll_deg,
                                 focal_mm, focal35, img_w, img_h]):
         return None
@@ -348,24 +368,31 @@ def project_pixel_mode_a(exif: dict, gcp: dict) -> Optional[Tuple[float, float]]
     mid_lat = math.radians((cam_lat + gcp_lat) / 2)
     dE = (gcp_lon - cam_lon) * METERS_PER_DEG_LAT * math.cos(mid_lat)
     dN = (gcp_lat - cam_lat) * METERS_PER_DEG_LAT
-    dU = gcp_alt - cam_alt   # negative when GCP is below camera
+    dU = gcp_alt - cam_alt
 
-    if dU >= 0:
-        return None  # GCP at or above camera
+    # --- 3D camera axes in ENU ---
+    psi   = math.radians(yaw_deg)
+    theta = math.radians(pitch_deg)
+    cp, sp = math.cos(psi),   math.sin(psi)
+    ct, st = math.cos(theta), math.sin(theta)
 
-    # --- Camera axes in ENU (nadir, pitch = −90°) ---
-    psi = math.radians(yaw_deg)
-    Xx, Xy =  math.cos(psi), -math.sin(psi)   # X_cam (image right)
-    Yx, Yy = -math.sin(psi), -math.cos(psi)   # Y_cam (image down)
+    # X_cam: image right — always horizontal
+    Xc = ( cp, -sp, 0.0)
+    # Z_cam: optical axis (look direction, positive into scene)
+    Zc = (ct * sp, ct * cp,  st)
+    # Y_cam: image down = Z_cam × X_cam
+    Yc = (st * sp, st * cp, -ct)
 
-    if abs(roll_deg - 180.0) < 1.0:
-        # Roll=180: camera rotated 180° around optical axis; flip both axes
-        Xx, Xy, Yx, Yy = -Xx, -Xy, -Yx, -Yy
+    # Roll=180°: camera mounted flipped 180° around optical axis
+    flip = -1.0 if abs(roll_deg - 180.0) < 1.0 else 1.0
 
     # --- Camera-frame coordinates ---
-    cam_x = Xx * dE + Xy * dN
-    cam_y = Yx * dE + Yy * dN
-    cam_z = -dU   # positive into scene
+    cam_x = flip * (Xc[0]*dE + Xc[1]*dN + Xc[2]*dU)
+    cam_y = flip * (Yc[0]*dE + Yc[1]*dN + Yc[2]*dU)
+    cam_z =         Zc[0]*dE + Zc[1]*dN + Zc[2]*dU   # depth; not flipped
+
+    if cam_z <= 0:
+        return None  # GCP behind or at camera plane
 
     # --- Pinhole projection ---
     px = fx * cam_x / cam_z + cx
@@ -477,10 +504,10 @@ def _cs_name_to_epsg(cs_name: str) -> Optional[str]:
     return None
 
 
-def _write_gcpeditpro(gcps: List[dict],
-                      estimates: Dict[str, Dict[str, dict]]) -> str:
+def _write_gcp_list(gcps: List[dict],
+                    estimates: Dict[str, Dict[str, dict]]) -> str:
     """
-    Write gcpeditpro.txt in gcp_list.txt format (GCPEditorPro / OpenDroneMap).
+    Build gcp_list.txt content for GCPEditorPro / OpenDroneMap.
 
     Prefers projected coordinates (easting, northing, elevation) from the Emlid
     CSV over WGS-84 lat/lon, because GCPEditorPro expects the same projected
@@ -489,8 +516,15 @@ def _write_gcpeditpro(gcps: List[dict],
     string, then to WGS-84 if projected coords are absent.
 
     Line 1: EPSG:xxxx or PROJ string
-    Lines 2+: geo_x geo_y geo_z px py image_name gcp_label  (one per image)
+    Lines 2+: geo_x\tgeo_y\tgeo_z\tpx\tpy\timage_name\tgcp_label\tconfidence  (one per image)
+
+    Tab-separated with trailing zeros stripped to match GCPEditorPro's download format,
+    enabling plain diff comparison between pipeline output and confirmed GCP download.
     """
+    def _fmt(v, decimals):
+        """Format float to fixed decimals, stripping trailing zeros."""
+        return f"{v:.{decimals}f}".rstrip('0').rstrip('.')
+
     gcp_by_label = {g['label']: g for g in gcps}
 
     # Prefer projected easting/northing/elevation when available
@@ -501,8 +535,15 @@ def _write_gcpeditpro(gcps: List[dict],
         for g in gcps
     )
 
+    labels = list(estimates.keys())
+    if labels and all(lbl.lstrip('-').isdigit() for lbl in labels):
+        labels.sort(key=lambda lbl: int(lbl))
+    else:
+        labels.sort()
+
     rows = []
-    for gcp_label, img_map in estimates.items():
+    for gcp_label in labels:
+        img_map = estimates[gcp_label]
         gcp = gcp_by_label.get(gcp_label)
         if not gcp:
             continue
@@ -513,11 +554,11 @@ def _write_gcpeditpro(gcps: List[dict],
         if None in (x, y, z):
             continue
         for img_name, est in img_map.items():
-            rows.append(
-                f"{x:.4f} {y:.4f} {z:.4f} "
-                f"{est['px']:.2f} {est['py']:.2f} "
-                f"{img_name} {gcp_label}"
-            )
+            rows.append('\t'.join([
+                _fmt(x, 3), _fmt(y, 3), _fmt(z, 3),
+                _fmt(est['px'], 2), _fmt(est['py'], 2),
+                img_name, gcp_label, 'projection',
+            ]))
 
     if not rows:
         return ''
@@ -531,19 +572,40 @@ def _write_gcpeditpro(gcps: List[dict],
     return proj + '\n' + '\n'.join(rows) + '\n'
 
 
+def _write_pix4d(estimates: Dict[str, Dict[str, dict]]) -> str:
+    """
+    Build pix4d.txt content: GCP image position file for Pix4D.
+
+    Comma-separated with header; one row per (image, GCP) pair.
+    Columns: Filename,Label,PixelX,PixelY
+    """
+    rows = ['Filename,Label,PixelX,PixelY']
+    for gcp_label, img_map in estimates.items():
+        for img_name, est in img_map.items():
+            rows.append(f"{img_name},{gcp_label},{est['px']:.2f},{est['py']:.2f}")
+    return '\n'.join(rows) + '\n' if len(rows) > 1 else ''
+
+
 def _compute_estimates_mode_a(
         image_to_gcps: Dict[str, List[str]],
         exif_map: Dict[str, dict],
-        gcp_by_label: Dict[str, dict]) -> Dict[str, Dict[str, dict]]:
+        gcp_by_label: Dict[str, dict],
+        nadir_only: bool = False) -> Dict[str, Dict[str, dict]]:
     """
     Compute pixel estimates for all (image, GCP) pairs using Mode A (EXIF).
+
+    nadir_only: if True, skip images whose gimbal pitch is not near -90°.
 
     Returns {gcpLabel: {imgFilename: {px, py, mode}}}
     """
     estimates: Dict[str, Dict[str, dict]] = {}
+    skipped_oblique = 0
     for fname, gcp_labels in image_to_gcps.items():
         exif = exif_map.get(fname)
         if exif is None:
+            continue
+        if nadir_only and not is_nadir(exif):
+            skipped_oblique += 1
             continue
         for label in gcp_labels:
             gcp = gcp_by_label.get(label)
@@ -556,6 +618,8 @@ def _compute_estimates_mode_a(
             if label not in estimates:
                 estimates[label] = {}
             estimates[label][fname] = {'px': px, 'py': py, 'mode': 'exif'}
+    if nadir_only and skipped_oblique:
+        print(f"  --nadir-only: skipped {skipped_oblique} oblique image(s)")
     return estimates
 
 
@@ -563,15 +627,18 @@ def run_pipeline(images_dir: str,
                  emlid_csv_path: str,
                  reconstruction_path: Optional[str] = None,
                  fallback_radius_m: float = 50.0,
-                 threads: int = 0) -> Tuple[str, str]:
+                 threads: int = 0,
+                 nadir_only: bool = False) -> Tuple[str, dict]:
     """
     Full pipeline: B1 → B2 → B3.
 
-    Returns (gcpeditpro_txt_content, estimates_json_content).
+    Returns (gcp_txt_content, estimates_dict).
 
     If reconstruction_path is provided and valid, Mode B projection is used
     for images that have a matching shot in the reconstruction. All remaining
     images use Mode A (EXIF-based).
+
+    nadir_only: skip images whose gimbal pitch is not near -90°.
     """
     # B1 — Parse inputs
     print("Parsing Emlid CSV...")
@@ -612,8 +679,12 @@ def run_pipeline(images_dir: str,
         cameras = reconstruction.get('cameras', {})
         # Mode B where available, Mode A fallback
         estimates: Dict[str, Dict[str, dict]] = {}
+        skipped_oblique = 0
         for fname, gcp_labels in image_to_gcps.items():
             exif = exif_map.get(fname)
+            if nadir_only and exif and not is_nadir(exif):
+                skipped_oblique += 1
+                continue
             shot = shots.get(fname)
             for label in gcp_labels:
                 gcp = gcp_by_label.get(label)
@@ -634,14 +705,16 @@ def run_pipeline(images_dir: str,
                     if label not in estimates:
                         estimates[label] = {}
                     estimates[label][fname] = {'px': px, 'py': py, 'mode': mode_used}
+        if nadir_only and skipped_oblique:
+            print(f"  --nadir-only: skipped {skipped_oblique} oblique image(s)")
     else:
-        estimates = _compute_estimates_mode_a(image_to_gcps, exif_map, gcp_by_label)
+        estimates = _compute_estimates_mode_a(image_to_gcps, exif_map, gcp_by_label,
+                                              nadir_only=nadir_only)
 
     # B3 — Write outputs
-    gcpeditpro_txt = _write_gcpeditpro(gcps, estimates)
-    estimates_json = json.dumps(estimates, indent=2)
+    gcp_txt = _write_gcp_list(gcps, estimates)
 
-    return gcpeditpro_txt, estimates_json
+    return gcp_txt, estimates
 
 
 # ---------------------------------------------------------------------------
@@ -651,18 +724,20 @@ def run_pipeline(images_dir: str,
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
-        description='GCP estimation pipeline: Emlid CSV + drone images → gcpeditpro.txt + estimates.json'
+        description='emlid2gcp: Emlid CSV + drone images → gcpeditpro.txt + pix4d.txt'
     )
     parser.add_argument('emlid_csv',  help='Emlid CSV file path')
     parser.add_argument('image_dir',  help='Directory of drone images')
     parser.add_argument('--reconstruction', default=None,
                         help='Path to opensfm/reconstruction.json (enables Mode B)')
     parser.add_argument('--out-dir',  default='.',
-                        help='Output directory for gcpeditpro.txt and estimates.json (default: .)')
+                        help='Output directory for gcpeditpro.txt, gcpeditpro.json, and pix4d.txt (default: .)')
     parser.add_argument('--radius',   type=float, default=50.0,
                         help='Fallback footprint radius in metres (default 50)')
     parser.add_argument('--threads',  type=int,   default=0,
                         help='Worker threads (default: all CPUs)')
+    parser.add_argument('--nadir-only', action='store_true',
+                        help=f'Skip oblique images (gimbal pitch not within {NADIR_TOL_DEG}° of -90°)')
     parser.add_argument('--b1-only',  action='store_true',
                         help='Run B1 only (footprint match) and print results without writing files')
     args = parser.parse_args()
@@ -687,22 +762,23 @@ if __name__ == '__main__':
         for fname, labels in sorted(image_to_gcps.items()):
             print(f'  {fname}: {labels}')
     else:
-        gcpeditpro_txt, estimates_json = run_pipeline(
+        gcp_txt, estimates = run_pipeline(
             images_dir=args.image_dir,
             emlid_csv_path=args.emlid_csv,
             reconstruction_path=args.reconstruction,
             fallback_radius_m=args.radius,
             threads=args.threads,
+            nadir_only=args.nadir_only,
         )
 
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        gcp_out = out_dir / 'gcpeditpro.txt'
-        est_out = out_dir / 'gcpeditpro.estimates.json'
+        gcp_out   = out_dir / 'gcpeditpro.txt'
+        pix4d_out = out_dir / 'pix4d.txt'
 
-        gcp_out.write_text(gcpeditpro_txt)
-        est_out.write_text(estimates_json)
+        gcp_out.write_text(gcp_txt)
+        pix4d_out.write_text(_write_pix4d(estimates))
 
         print(f'\nWrote {gcp_out}')
-        print(f'Wrote {est_out}')
+        print(f'Wrote {pix4d_out}')
